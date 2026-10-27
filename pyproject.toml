@@ -1,0 +1,26 @@
+[project]
+name = "balanceloop"
+version = "0.2.0"
+description = "BalanceLoop — One-Person AI Company for reviewed lifestyle support (ELEC5620 Stage 2 prototype). Python backend in backend/, Vue frontend in frontend/."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.uv]
+package = false            # an application, not a library: `uv sync` installs dependencies only
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
+filterwarnings = ["ignore::DeprecationWarning"]
