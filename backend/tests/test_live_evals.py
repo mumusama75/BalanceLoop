@@ -5,7 +5,7 @@ import sys
 import httpx
 import pytest
 
-from evals.run import DATASET, FixtureModel, evaluate, main
+from evals.run import DATASET, FixtureModel, evaluate, main, report_directory
 
 
 @pytest.fixture
@@ -156,3 +156,53 @@ def test_cloud_cli_uses_live_default_and_env_key(monkeypatch, tmp_path, cloud):
     assert "selected-model" in (tmp_path / "report.md").read_text()
     assert cloud[0]["headers"]["Authorization"] == "Bearer test-key"
     assert "test-key" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("filename", ["report.json", "report.md", ".evaluation.lock"])
+def test_existing_results_or_running_evaluation_fail_before_model_calls(monkeypatch, tmp_path, filename):
+    original = tmp_path / filename
+    original.write_text("previous experiment", encoding="utf-8")
+    def forbidden(*args, **kwargs):
+        pytest.fail("evaluation started despite occupied output directory")
+    monkeypatch.setattr("evals.run.evaluate", forbidden)
+    monkeypatch.setattr(sys, "argv", ["evals.run", "--output", str(tmp_path)])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert original.read_text(encoding="utf-8") == "previous experiment"
+    if filename != ".evaluation.lock":
+        assert not (tmp_path / ".evaluation.lock").exists()
+
+
+def test_concurrent_reservation_cannot_remove_first_runs_lock(tmp_path):
+    with report_directory(tmp_path):
+        with pytest.raises(ValueError, match="reserved"):
+            with report_directory(tmp_path):
+                pytest.fail("second reservation succeeded")
+        assert (tmp_path / ".evaluation.lock").exists()
+    assert not (tmp_path / ".evaluation.lock").exists()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("harness failed"), KeyboardInterrupt()])
+def test_failed_or_interrupted_evaluation_releases_reservation(monkeypatch, tmp_path, error):
+    def fail(*args, **kwargs):
+        raise error
+    monkeypatch.setattr("evals.run.evaluate", fail)
+    monkeypatch.setattr(sys, "argv", ["evals.run", "--output", str(tmp_path)])
+    with pytest.raises(type(error)):
+        main()
+    assert not (tmp_path / ".evaluation.lock").exists()
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_invalid_output_path_fails_before_evaluation(monkeypatch, tmp_path):
+    output = tmp_path / "not-a-directory"
+    output.write_text("keep me", encoding="utf-8")
+    def forbidden(*args, **kwargs):
+        pytest.fail("evaluation started before output validation")
+    monkeypatch.setattr("evals.run.evaluate", forbidden)
+    monkeypatch.setattr(sys, "argv", ["evals.run", "--output", str(output)])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert output.read_text(encoding="utf-8") == "keep me"

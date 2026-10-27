@@ -7,6 +7,7 @@ import json
 import math
 import os
 import subprocess
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from time import perf_counter
@@ -293,6 +294,26 @@ def markdown(report):
     return "\n".join(lines) + "\n"
 
 
+@contextmanager
+def report_directory(path):
+    """Reserve output before any model calls; never overwrite another experiment."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    lock = path / ".evaluation.lock"
+    try:
+        handle = lock.open("x", encoding="utf-8")
+    except FileExistsError:
+        raise ValueError("output directory is reserved by another evaluation; use a new --output directory") from None
+    try:
+        with handle:
+            handle.write(str(os.getpid()))
+        if any((path / name).exists() for name in ("report.json", "report.md")):
+            raise ValueError("output directory already contains a report; use a new --output directory")
+        yield path
+    finally:
+        lock.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path)
@@ -305,13 +326,13 @@ def main():
     parser.add_argument("--timeout", type=float, default=60)
     args = parser.parse_args()
     try:
-        report = evaluate(args.dataset, provider=args.provider, model=args.model, base_url=args.base_url,
-                          api_key=os.environ.get(args.api_key_env), repeats=args.repeats, timeout=args.timeout)
-    except ValueError as error:
+        with report_directory(args.output):
+            report = evaluate(args.dataset, provider=args.provider, model=args.model, base_url=args.base_url,
+                              api_key=os.environ.get(args.api_key_env), repeats=args.repeats, timeout=args.timeout)
+            (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            (args.output / "report.md").write_text(markdown(report), encoding="utf-8")
+    except (ValueError, OSError) as error:
         parser.error(str(error))
-    args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    (args.output / "report.md").write_text(markdown(report), encoding="utf-8")
     print(markdown(report))
 
 
