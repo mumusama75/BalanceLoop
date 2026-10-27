@@ -61,6 +61,14 @@ def test_uc05_ready_then_uc06_released(client):
     steps = [t["step"] for t in d["trace"]]
     assert "applyHardRules" in steps and "computeRiskScore" in steps and "release" in steps
     assert any(t["llm_used"] for t in d["trace"])  # LLM drafted, rules decided
+    calls = [t for t in d["trace"] if t["step"] == "llmCall"]
+    assert calls
+    assert all(t["detail"]["mock"] and t["detail"]["attempt_count"] == 0 for t in calls)
+    assert all(t["detail"]["usage"]["total_tokens"] is None for t in calls)
+    request_id = calls[0]["detail"]["request_id"]
+    replay = client.get(f"/api/founder/requests/{request_id}/replay", headers=FOUNDER).json()
+    saved = [t["detail"] for t in replay["trace"] if t["step"] == "llmCall"]
+    assert saved == [t["detail"] for t in calls]
 
 
 # ---------------------------------------------------------------- UC03 → UC09 integration with the released exercise plan
@@ -221,3 +229,37 @@ def test_founder_replay_has_trace_audit_and_cases(client):
     rp = client.get(f"/api/founder/requests/{reqs[0]['request_id']}/replay", headers=FOUNDER).json()
     assert rp["trace"] and rp["audit"]
     assert client.get("/api/founder/audit", headers=SAM).status_code == 403
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_cloud_call_metrics_survive_api_and_audit_replay(client, monkeypatch, fails):
+    import httpx
+    from app.llm.cloud_client import CloudLLMClient
+    gateway = CloudLLMClient("https://model.example", "test-key", "test-model")
+
+    def fake_post(url, **kwargs):
+        if fails:
+            raise httpx.ReadTimeout("private-provider-message")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}],
+                              "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    app.dependency_overrides[get_llm] = lambda: gateway
+    try:
+        response = post(client, "/api/profile", {"goals": ["maintain habits"],
+                        "allergy_status": "none", "available_time_min": 30,
+                        "free_text": "prefer walking", "confirm": False})
+        calls = [s for s in response["trace"] if s["step"] == "llmCall"]
+        assert len(calls) == 1
+        d = calls[0]["detail"]
+        assert d["operation"] == "interpret_constraints"
+        assert d["status"] == ("error" if fails else "success")
+        assert d["usage"]["total_tokens"] == (None if fails else 12)
+        assert d["attempt_count"] == 1 and d["retry_count"] == 0
+        assert d["mock"] is False and d["latency_ms"] >= 0
+        replay = client.get(f"/api/founder/requests/{d['request_id']}/replay", headers=FOUNDER).json()
+        assert [s["detail"] for s in replay["trace"] if s["step"] == "llmCall"] == [d]
+        assert "private-provider-message" not in str(replay)
+    finally:
+        app.dependency_overrides.pop(get_llm, None)

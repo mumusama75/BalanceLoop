@@ -14,6 +14,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from .gateway import LLMGateway, LLMUnavailable
+from .telemetry import post_with_metrics
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -63,13 +64,13 @@ class CloudLLMClient(LLMGateway):
                 body_out = {"model": self.model, "messages": messages, "temperature": 0.3}
                 if self._json_mode:
                     body_out["response_format"] = {"type": "json_object"}
-                resp = httpx.post(f"{self.base_url}/chat/completions",
+                resp = post_with_metrics(f"{self.base_url}/chat/completions",
                                   headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                                   json=body_out, timeout=self.timeout)
                 if resp.status_code == 400 and self._json_mode and "response_format" in resp.text:
                     # self-hosted servers (older vLLM / Ollama) may not support JSON mode; the prompt still demands JSON
                     self._json_mode = False
-                    resp = httpx.post(f"{self.base_url}/chat/completions",
+                    resp = post_with_metrics(f"{self.base_url}/chat/completions",
                                       headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                                       json={"model": self.model, "messages": messages, "temperature": 0.3}, timeout=self.timeout)
                 resp.raise_for_status()

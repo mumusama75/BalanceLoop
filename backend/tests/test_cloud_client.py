@@ -141,3 +141,123 @@ def test_non_json_http_body_is_provider_failure(gateway, monkeypatch):
     with pytest.raises(LLMUnavailable):
         run(client)
     assert len(calls) == 1
+
+
+def traced(client, request_id="req-test"):
+    from app.llm.telemetry import TracedGateway
+    from app.services.trace import Trace
+    trace = Trace(request_id, "test-user")
+    return TracedGateway(client, trace, "TestAgent"), trace
+
+
+def test_trace_counts_all_attempts_and_partial_usage(gateway, monkeypatch):
+    from app.llm import telemetry
+    ticks = iter([0, 1, 2, 3, 4, 5, 6, 7])
+    monkeypatch.setattr(telemetry, "monotonic", lambda: next(ticks))
+    client, responses, _ = gateway
+    responses.extend([(400, {"error": "response_format unsupported"}),
+        (200, envelope("invalid", usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12})),
+        (200, envelope(usage={"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24}))])
+    proxy, trace = traced(client)
+    assert run(proxy).count == 2
+    assert len(trace.steps) == 1
+    span = trace.steps[0]
+    assert span.agent == "TestAgent" and span.model_version == client.model_version
+    d = span.detail
+    assert d["request_id"] == "req-test" and d["operation"] == "complete"
+    assert d["latency_ms"] == 7000
+    assert d["retry_count"] == 2 and d["attempt_count"] == 3
+    assert [a["latency_ms"] for a in d["attempts"]] == [1000, 1000, 1000]
+    assert [a["status_code"] for a in d["attempts"]] == [400, 200, 200]
+    assert d["usage"] == {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36}
+    assert not any(d["usage_complete"].values())
+
+
+@pytest.mark.parametrize("outcome", [httpx.ReadTimeout("private-payload"),
+    (429, {"error": "private-payload"}), (200, {"choices": []})])
+def test_failed_calls_are_traced_and_isolated_from_next_call(gateway, outcome):
+    client, responses, _ = gateway
+    responses.extend([outcome, (200, envelope(usage={"total_tokens": 8}))])
+    proxy, trace = traced(client)
+    with pytest.raises(LLMUnavailable):
+        run(proxy)
+    run(proxy)
+    failed, success = [s.detail for s in trace.steps]
+    assert failed["status"] == "error" and failed["error_type"] == "LLMUnavailable"
+    assert failed["usage"]["total_tokens"] is None
+    assert failed["attempt_count"] == 1 and failed["retry_count"] == 0
+    assert success["usage"]["total_tokens"] == 8
+    assert success["usage_complete"]["total_tokens"] is True
+    assert success["attempt_count"] == 1 and success["status"] == "success"
+    assert failed["call_id"] != success["call_id"]
+    assert "private-payload" not in str(trace.as_list())
+    assert "test-key" not in str(trace.as_list())
+
+
+def test_exhausted_repair_keeps_usage_from_both_invalid_outputs(gateway):
+    client, responses, _ = gateway
+    responses.extend([(200, envelope("bad", usage={"total_tokens": 7}))] * 2)
+    proxy, trace = traced(client)
+    with pytest.raises(LLMUnavailable):
+        run(proxy)
+    d = trace.steps[0].detail
+    assert d["status"] == "error" and d["retry_count"] == 1
+    assert d["usage"]["total_tokens"] == 14
+    assert d["usage_complete"]["total_tokens"] is True
+
+
+def test_missing_key_records_zero_attempts_and_unknown_usage(gateway):
+    client, _, _ = gateway
+    client.api_key = ""
+    proxy, trace = traced(client)
+    with pytest.raises(LLMUnavailable):
+        run(proxy)
+    d = trace.steps[0].detail
+    assert d["attempt_count"] == 0 and d["retry_count"] == 0
+    assert d["usage"]["total_tokens"] is None
+
+
+@pytest.mark.parametrize("usage", [None, [], {"total_tokens": -1}, {"total_tokens": True},
+    {"total_tokens": "secret", "unexpected": "private-payload"}])
+def test_usage_metadata_is_allowlisted(gateway, usage):
+    client, responses, _ = gateway
+    responses.append((200, envelope(usage=usage)))
+    proxy, trace = traced(client)
+    assert run(proxy).count == 2
+    assert trace.steps[0].detail["usage"]["total_tokens"] is None
+    assert "private-payload" not in str(trace.as_list())
+
+
+def test_concurrent_requests_on_shared_gateway_do_not_mix_metrics(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    barrier = Barrier(2)
+    client = CloudLLMClient("https://model.example", "test-key", "test-model")
+
+    def post(url, **kwargs):
+        count = int(kwargs["json"]["messages"][1]["content"])
+        barrier.wait(timeout=5)
+        return httpx.Response(200, json=envelope(usage={"total_tokens": count}),
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    def request(count):
+        proxy, trace = traced(client, f"req-{count}")
+        proxy.complete("Return JSON", str(count), Reply)
+        return trace.steps[0].detail
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(request, [11, 22]))
+    assert [d["request_id"] for d in records] == ["req-11", "req-22"]
+    assert [d["usage"]["total_tokens"] for d in records] == [11, 22]
+    assert all(d["attempt_count"] == 1 for d in records)
+
+
+def test_direct_call_after_traced_call_does_not_append_to_old_span(gateway):
+    client, responses, _ = gateway
+    responses.extend([(200, envelope()), (200, envelope())])
+    proxy, trace = traced(client)
+    run(proxy)
+    before = deepcopy(trace.steps[0].detail)
+    run(client)
+    assert trace.steps[0].detail == before

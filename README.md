@@ -81,7 +81,7 @@ API docs: <http://localhost:8000/docs>. Demo walkthrough: [docs/demo_script.md](
 
 Run `uv run pytest backend/tests/test_cloud_client.py -q` to exercise the real
 `CloudLLMClient` with simulated HTTP responses, without an API key or network calls.
-The 28 cases cover request construction, schema validation, malformed provider envelopes,
+The cases cover request construction, schema validation, malformed provider envelopes,
 empty content, timeouts, connection failures, HTTP errors (including 429), fenced JSON,
 and compatibility fallback when a provider rejects `response_format`.
 
@@ -93,6 +93,30 @@ values are excluded from public error messages. Failed sequential calls clear st
 `last_meta`; this shared diagnostic field is not a concurrency-safe request tracing API.
 
 These tests establish gateway behavior, not real-model quality, latency, or safety accuracy.
+
+### Request-level model tracing
+
+Every agent gateway invocation appends an `llmCall` step to the request trace, on success
+or failure. It is returned in the API trace and persisted with existing `AgentTrace`
+records for `GET /api/founder/requests/{request_id}/replay`. Open **Show detail** in
+the pipeline drawer to inspect the statistics. No database migration is needed.
+
+Each span has a unique `call_id`, `request_id`, agent, operation, model version, status,
+total `latency_ms`, `attempt_count`, `retry_count`, token `usage` and per-HTTP-attempt
+timings/status codes. Retries count additional HTTP requests, including JSON-mode
+compatibility fallback and schema correction; a retry's tokens are included in totals.
+Each attempt also retains its own reported prompt/completion/total token counts.
+
+Missing or invalid token counts are `null`, not zero. Totals sum available observations;
+`usage_complete` marks each field false when any attempt omitted it. Mock calls are
+explicitly marked and have zero HTTP attempts with unknown token usage. No prompts,
+response text, credentials or provider error messages are copied into these metric spans.
+
+Collectors use `ContextVar` isolation and request-owned traces, never the shared client's
+`last_meta`. Tests cover concurrent requests sharing one cloud client, failed/retried
+calls, exact clock-controlled timings, and API-to-database replay for success and failure.
+Spans live in memory until the existing request trace save point; process crashes or
+database failures before that point are not durable telemetry delivery guarantees.
 
 ### Configuration: `backend/.env`
 

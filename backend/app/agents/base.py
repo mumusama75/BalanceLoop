@@ -13,6 +13,7 @@ from ..config import Settings
 from ..domain.enums import AgentRole
 from ..external.nutrition_local import LocalNutritionSource
 from ..llm.gateway import LLMGateway
+from ..llm.telemetry import TracedGateway
 from ..repository.versioned_store import VersionedRecordStore
 from ..services.trace import Trace
 
@@ -38,6 +39,7 @@ class Agent(ABC):
         self.ctx = ctx
         self.agent_id = f"{self.role.value.lower()}-{self.agent_version}"
         self._last_explanation: str = ""
+        self._traced_llm = TracedGateway(ctx.llm, ctx.trace, self.role.value)
 
     # ---- shared infrastructure
     @property
@@ -45,8 +47,8 @@ class Agent(ABC):
         return self.ctx.repo
 
     @property
-    def llm(self) -> LLMGateway:
-        return self.ctx.llm
+    def llm(self) -> TracedGateway:
+        return self._traced_llm
 
     @property
     def model_version(self) -> str:
