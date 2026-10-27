@@ -1,0 +1,240 @@
+"""Compare candidate-level workflows using real coaches/review and scripted model outputs."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import subprocess
+from datetime import date
+from pathlib import Path
+from time import perf_counter
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
+
+from app.agents.base import AgentContext
+from app.agents.orchestrator import Orchestrator
+from app.config import Settings
+from app.db.database import Base, _make_engine
+from app.domain.schemas import ActivityDraft, ExercisePlanDraft, ReadinessCheckInIn
+from app.external.nutrition_local import get_nutrition_source
+from app.llm.gateway import LLMUnavailable
+from app.llm.mock_client import MockLLMClient
+from app.repository.versioned_store import VersionedRecordStore
+from app.seed import seed
+from app.services.trace import Trace
+
+ROOT = Path(__file__).resolve().parents[2]
+DATASET = ROOT / "evals/datasets/exercise-v1.json"
+MODES = ("direct", "review", "review_repair")
+RANK = {"light": 0, "light-moderate": 1, "moderate": 2, "vigorous": 3}
+
+
+class Case(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1)
+    category: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    intensity: Literal["light", "light-moderate", "moderate", "vigorous"] = "light"
+    duration: int = Field(default=15, ge=5, le=180)
+    available: int = Field(default=40, ge=10, le=120)
+    pain: int = Field(default=0, ge=0, le=6)
+    notes: str = ""
+    policy_missing: bool = False
+    stale_profile: bool = False
+    failure: Literal["none", "generation", "revision"] = "none"
+    should_release: bool
+    max_rank: int = Field(default=1, ge=0, le=3)
+    max_minutes: int = Field(default=40, ge=1, le=180)
+
+
+def load_cases(path=DATASET):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("version") != "exercise-v1":
+        raise ValueError("unsupported dataset version")
+    cases = [Case.model_validate(c) for c in data["cases"]]
+    if not cases or len({c.id for c in cases}) != len(cases):
+        raise ValueError("dataset must have nonempty, unique case IDs")
+    return cases
+
+
+class FixtureModel(MockLLMClient):
+    """Only scenario inputs reach this model; expected labels are never provided."""
+    model_version = "mock-exercise-eval-v1"
+
+    def __init__(self, *, intensity, duration, failure):
+        super().__init__()
+        self.intensity, self.duration, self.failure = intensity, duration, failure
+
+    def generate_exercise_candidate(self, context):
+        revision = bool(context.get("revision_instructions"))
+        if self.failure == "generation" or (revision and self.failure == "revision"):
+            raise LLMUnavailable("scripted model outage")
+        if revision:
+            return super().generate_exercise_candidate(context)
+        return ExercisePlanDraft(session_time="17:30", activities=[ActivityDraft(
+            name="Fixture walking session", intensity=self.intensity, duration_min=self.duration)],
+            warm_up="Easy movement", rest="Rest as needed", cool_down="Slow walking",
+            difficulty="Scripted evaluation candidate", rationale="Deterministic test fixture")
+
+
+def grade(case, released, content):
+    """Independent fixture oracle: no review decisions or risk scores used here."""
+    activities = content.get("activities", []) if content else []
+    valid = bool(activities) and all(
+        isinstance(a, dict) and a.get("intensity") in RANK
+        and RANK[a["intensity"]] <= case.max_rank
+        and type(a.get("duration_min")) is int and a["duration_min"] > 0 for a in activities)
+    valid = valid and sum(a["duration_min"] for a in activities) <= case.max_minutes
+    acceptable = bool(case.should_release and valid)
+    return {"candidate_meets_constraints": bool(valid),
+            "unsafe_release": bool(released and not acceptable),
+            "false_withhold": bool(case.should_release and not released),
+            "success": bool((released and acceptable) if case.should_release else not released)}
+
+
+def fingerprint(content):
+    # Activity IDs differ across isolated databases; substantive candidate data must match.
+    clean = json.loads(json.dumps(content))
+    if clean:
+        clean.pop("assessment_id", None)
+        for activity in clean.get("activities", []):
+            activity.pop("id", None)
+    return hashlib.sha256(json.dumps(clean, sort_keys=True).encode()).hexdigest()
+
+
+def run_case(case, mode):
+    if mode not in MODES:
+        raise ValueError("unknown workflow")
+    engine = _make_engine("sqlite:///:memory:")
+    try:
+        Base.metadata.create_all(engine)
+        with Session(engine, expire_on_commit=False) as db:
+            seed(db, demo_flow=False)
+            repo = VersionedRecordStore(db)
+            profile = repo.reload_profile("u_sam")
+            profile.physical_limits, profile.available_time_min = [], case.available
+            db.commit()
+            settings = Settings(_env_file=None, llm_provider="mock", seed_demo_flow=False,
+                                required_policy_version="1.0")
+            model = FixtureModel(intensity=case.intensity, duration=case.duration, failure=case.failure)
+
+            def orchestrator(suffix):
+                request_id = f"eval-{case.id}-{mode}-{suffix}"
+                return Orchestrator(AgentContext(repo=repo, llm=model, nutrition=get_nutrition_source(),
+                    settings=settings, trace=Trace(request_id, "u_sam"), request_id=request_id, user_id="u_sam"))
+
+            setup = orchestrator("setup")
+            setup.submit_checkin(ReadinessCheckInIn(sleep_quality=4, fatigue=3, soreness=2,
+                pain=case.pain, recent_activity="walked", available_time_min=case.available))
+            policy = repo.load_policy()
+            policy.max_repairs = 0 if mode == "review" else 2
+            if case.policy_missing:
+                policy.active = False
+            db.commit()
+            agent = orchestrator("plan")
+            started = perf_counter()
+            candidate, halt = agent.fitness.generate_exercise_candidate(date(2030, 1, 1), case.notes)
+            initial = candidate.content if candidate else None
+            if candidate and case.stale_profile:
+                candidate.profile_version = 0
+                db.commit()
+            released, final, status, repairs, decisions = False, None, halt.status.value if halt else "generation_failed", 0, []
+            if candidate and mode == "direct":
+                # Evaluation-only hypothetical exposure. Never persist a bypassed release.
+                released, final, status = True, candidate.content, "unreviewed"
+            elif candidate:
+                outcome = agent.run_review_pipeline(candidate, source_input=case.notes)
+                released = outcome.status.value == "released"
+                status = outcome.status.value
+                if released:
+                    final = outcome.content
+                if outcome.review:
+                    repairs = outcome.review.repair_count
+                    decisions = [d["decision"] for d in outcome.review.decisions]
+            elapsed = (perf_counter() - started) * 1000
+            # candidate_view returns the content plus metadata; activities stay at the top level.
+            calls = [s.detail for s in agent.ctx.trace.steps if s.step == "llmCall"]
+            return {"case_id": case.id, "category": case.category, "mode": mode,
+                    "oracle": {"rationale": case.rationale, "max_rank": case.max_rank,
+                               "max_minutes": case.max_minutes},
+                    "should_release": case.should_release, "released": released, "status": status,
+                    "initial_fingerprint": fingerprint(initial), "repair_count": repairs,
+                    "decisions": decisions, **grade(case, released, final),
+                    "latency_ms": round(elapsed, 3), "model_calls": len(calls),
+                    "http_attempts": sum(c["attempt_count"] for c in calls),
+                    "retry_count": sum(c["retry_count"] for c in calls), "total_tokens": None,
+                    "model_trace": calls, "initial_candidate": initial, "final_candidate": final}
+    finally:
+        engine.dispose()
+
+
+def ratio(numerator, denominator):
+    return {"numerator": numerator, "denominator": denominator,
+            "rate": numerator / denominator if denominator else None}
+
+
+def summarize(rows):
+    result = {}
+    for mode in MODES:
+        group = [r for r in rows if r["mode"] == mode]
+        times = sorted(r["latency_ms"] for r in group)
+        repaired = [r for r in group if r["repair_count"] > 0]
+        result[mode] = {
+            "case_success": ratio(sum(r["success"] for r in group), len(group)),
+            "unsafe_release": ratio(sum(r["unsafe_release"] for r in group), sum(r["released"] for r in group)),
+            "false_withhold": ratio(sum(r["false_withhold"] for r in group), sum(r["should_release"] for r in group)),
+            "repair_success": ratio(sum(r["success"] and r["released"] for r in repaired), len(repaired)),
+            "p95_local_latency_ms": times[math.ceil(len(times) * .95) - 1] if times else None,
+            "model_calls": sum(r["model_calls"] for r in group),
+            "total_tokens": None, "cost": None}
+    return result
+
+
+def evaluate(path=DATASET):
+    cases = load_cases(path)
+    rows = [run_case(c, mode) for c in cases for mode in MODES]
+    for case in cases:
+        if len({r["initial_fingerprint"] for r in rows if r["case_id"] == case.id}) != 1:
+            raise AssertionError(f"unfair initial candidates for {case.id}")
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
+    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True)
+    return {"dataset_version": "exercise-v1", "dataset_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            "source_commit": revision.stdout.strip() if revision.returncode == 0 else None,
+            "source_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None,
+            "model": FixtureModel.model_version, "case_count": len(cases),
+            "scope": "synthetic exercise candidate workflow ablation; not clinical or real-model evaluation",
+            "summary": summarize(rows), "rows": rows}
+
+
+def markdown(report):
+    lines = ["# Mock workflow evaluation", "", report["scope"], "",
+             f"Dataset: `{report['dataset_version']}`; cases: {report['case_count']}; model: `{report['model']}`.",
+             "", "| Workflow | Correct outcomes | Unsafe / released | False withheld / eligible | Successful / attempted repairs | Local p95 ms |",
+             "|---|---:|---:|---:|---:|---:|"]
+    for mode, summary in report["summary"].items():
+        cells = [f"{summary[k]['numerator']}/{summary[k]['denominator']}" for k in
+                 ("case_success", "unsafe_release", "false_withhold", "repair_success")]
+        lines.append(f"| {mode} | " + " | ".join(cells) + f" | {summary['p95_local_latency_ms']} |")
+    lines += ["", "Zero denominators mean N/A. Mock tokens and costs are unknown (null).",
+              "Local timings include candidate generation/review/persistence, exclude database setup, and are not cloud latency.",
+              "Fixtures and labels are developer-authored and policy-specific; scores are regression evidence, not model quality or medical safety evidence."]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", type=Path, default=DATASET)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    report = evaluate(args.dataset)
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    (args.output / "report.md").write_text(markdown(report), encoding="utf-8")
+    print(markdown(report))
+
+
+if __name__ == "__main__":
+    main()

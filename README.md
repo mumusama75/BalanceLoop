@@ -22,6 +22,10 @@ the Safety Supervisor**:
  founder ──▶ policy, incidents, audit replay           every step: AuditRecord + AgentTrace (AR-10)
 ```
 
+## Offline workflow evaluation
+
+The [evaluation guide](evals/README.md) compares direct generation, generation + review, and generation + review + repair on 15 synthetic exercise scenarios. It runs the real review/repair pipeline with a scripted mock model and produces JSON/Markdown reports with independent constraint scores and request-level telemetry. These are workflow regression results, not real-model quality or clinical safety claims.
+
 ## Repository layout
 
 ```
