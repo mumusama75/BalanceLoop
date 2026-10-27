@@ -26,6 +26,8 @@ the Safety Supervisor**:
 
 The [evaluation guide](evals/README.md) compares direct generation, generation + review, and generation + review + repair on 15 synthetic exercise scenarios. It runs the real review/repair pipeline with a scripted mock model and produces JSON/Markdown reports with independent constraint scores and request-level telemetry. These are workflow regression results, not real-model quality or clinical safety claims.
 
+Opt-in cloud evaluation supports model/endpoint selection and repeated runs on a separate seven-scenario input dataset, recording success rates, mean/p95 latency, token completeness, retries and provider failures. The cloud integration is tested offline; live benchmark scores must be collected separately.
+
 ## Repository layout
 
 ```
