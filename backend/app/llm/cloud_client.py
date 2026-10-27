@@ -49,6 +49,7 @@ class CloudLLMClient(LLMGateway):
         return t.strip()
 
     def complete(self, system: str, user: str, schema: Type[T]) -> T:
+        self.last_meta = {}
         if not self.api_key:
             raise LLMUnavailable("no API key configured")
         schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
@@ -56,10 +57,8 @@ class CloudLLMClient(LLMGateway):
             {"role": "system", "content": f"{system}\n\nJSON Schema for your reply:\n{schema_json}"},
             {"role": "user", "content": user},
         ]
-        last_error: Exception | None = None
-        content = ""
         for attempt in range(2):
-            started = time.time()
+            started = time.monotonic()
             try:
                 body_out = {"model": self.model, "messages": messages, "temperature": 0.3}
                 if self._json_mode:
@@ -74,18 +73,36 @@ class CloudLLMClient(LLMGateway):
                                       headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                                       json={"model": self.model, "messages": messages, "temperature": 0.3}, timeout=self.timeout)
                 resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise LLMUnavailable(f"provider HTTP {e.response.status_code}") from None
+            except httpx.HTTPError as e:
+                # Do not expose URLs, response bodies or provider exception text to traces/users.
+                raise LLMUnavailable(f"provider transport failure ({type(e).__name__})") from None
+
+            try:
                 body = resp.json()
+                if not isinstance(body, dict) or not isinstance(body.get("choices"), list):
+                    raise ValueError("invalid envelope")
                 content = body["choices"][0]["message"]["content"]
-                self.last_meta = {"latency_ms": int((time.time() - started) * 1000),
-                                  "usage": body.get("usage", {}), "attempt": attempt + 1}
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("missing text content")
+            except (ValueError, KeyError, IndexError, TypeError):
+                # Invalid provider envelopes are not model output that a corrective prompt can fix.
+                raise LLMUnavailable("invalid provider response: expected non-empty message content") from None
+
+            try:
                 data = json.loads(self._strip_fences(content))
-                return schema.model_validate(data)
-            except (httpx.HTTPError, KeyError) as e:
-                last_error = e
-                break  # transport problems: do not retry with a correction, fail over
+                result = schema.model_validate(data)
             except (json.JSONDecodeError, ValidationError) as e:
-                last_error = e
+                if attempt == 1:
+                    raise LLMUnavailable("model output failed schema validation after 2 attempts") from None
+                # ValidationError.__str__ includes input values; do not copy them into diagnostics.
+                reason = "invalid JSON" if isinstance(e, json.JSONDecodeError) else "schema mismatch"
                 messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": f"That reply did not validate against the schema: {e}. "
+                messages.append({"role": "user", "content": f"That reply did not validate against the schema ({reason}). "
                                                             f"Return ONLY a corrected JSON object."})
-        raise LLMUnavailable(f"{type(last_error).__name__}: {last_error}")
+                continue
+            self.last_meta = {"latency_ms": int((time.monotonic() - started) * 1000),
+                              "usage": body.get("usage", {}), "attempt": attempt + 1}
+            return result
+        raise LLMUnavailable("model output unavailable")  # defensive: loop always returns or raises

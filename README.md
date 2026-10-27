@@ -71,11 +71,28 @@ or interprets — every safety decision is made by rules, and the pipeline drawe
 Useful extras:
 
 ```bash
-uv run pytest -q                                     # 70 tests, offline, ~2 s
+uv run pytest -q                                     # offline backend regression suite
 curl -X POST http://localhost:8000/api/admin/reset-demo   # wipe + re-seed (?demo_flow=false for an empty day)
 ```
 
 API docs: <http://localhost:8000/docs>. Demo walkthrough: [docs/demo_script.md](docs/demo_script.md).
+
+### Cloud gateway contracts (offline)
+
+Run `uv run pytest backend/tests/test_cloud_client.py -q` to exercise the real
+`CloudLLMClient` with simulated HTTP responses, without an API key or network calls.
+The 28 cases cover request construction, schema validation, malformed provider envelopes,
+empty content, timeouts, connection failures, HTTP errors (including 429), fenced JSON,
+and compatibility fallback when a provider rejects `response_format`.
+
+Transport/HTTP failures and invalid provider envelopes raise `LLMUnavailable` immediately
+so callers can degrade safely. Invalid model JSON or schema mismatches get at most one
+corrective retry. Disabling unsupported JSON mode can add one compatibility request
+(at most three HTTP calls in a completion). Provider error bodies and validation input
+values are excluded from public error messages. Failed sequential calls clear stale
+`last_meta`; this shared diagnostic field is not a concurrency-safe request tracing API.
+
+These tests establish gateway behavior, not real-model quality, latency, or safety accuracy.
 
 ### Configuration: `backend/.env`
 
