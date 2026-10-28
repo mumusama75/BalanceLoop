@@ -1,10 +1,12 @@
 """Offline workflow ablation contracts; scores describe fixtures, not model quality."""
+import hashlib
 import json
 
 import httpx
 import pytest
 
 from evals.run import Case, MODES, evaluate, fingerprint, grade, load_cases, markdown, ratio, summarize
+from evals import run
 
 
 @pytest.fixture(scope="module")
@@ -114,6 +116,34 @@ def test_fingerprint_ignores_only_generated_identifiers():
     assert fingerprint(first) == fingerprint(second)
     second["activities"][0]["duration_min"] = 11
     assert fingerprint(first) != fingerprint(second)
+
+
+@pytest.mark.parametrize("change", ["replace", "delete"])
+def test_report_uses_dataset_snapshot_when_file_changes(tmp_path, monkeypatch, change):
+    case = load_cases()[0].model_dump()
+    original = json.dumps({"version": "exercise-v1", "cases": [case]}).encode("utf-8")
+    path = tmp_path / "cases.json"
+    path.write_bytes(original)
+    original_run_case = run.run_case
+    calls = 0
+
+    def change_dataset(*args, **kwargs):
+        nonlocal calls
+        if calls == 0:
+            if change == "replace":
+                path.write_text('{"version":"changed","cases":[]}', encoding="utf-8")
+            else:
+                path.unlink()
+        calls += 1
+        return original_run_case(*args, **kwargs)
+
+    monkeypatch.setattr(run, "run_case", change_dataset)
+    result = evaluate(path, repeats=2)
+    assert result["dataset_sha256"] == hashlib.sha256(original).hexdigest()
+    assert result["dataset_version"] == "exercise-v1"
+    assert result["case_count"] == 1
+    assert len(result["rows"]) == calls == 6
+    assert {r["case_id"] for r in result["rows"]} == {case["id"]}
 
 
 def test_report_discloses_mock_scope(report):

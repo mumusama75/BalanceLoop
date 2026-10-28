@@ -58,6 +58,10 @@ class Case(BaseModel):
 
 def load_cases(path=DATASET):
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return parse_cases(data)
+
+
+def parse_cases(data):
     if data.get("version") not in ("exercise-v1", "exercise-live-v1"):
         raise ValueError("unsupported dataset version")
     cases = [Case.model_validate(c) for c in data["cases"]]
@@ -229,7 +233,8 @@ def evaluate(path=None, *, provider="mock", model=None, base_url=None, api_key=N
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be positive and finite")
     path = Path(path or (LIVE_DATASET if provider == "cloud" else DATASET))
-    data = json.loads(path.read_text(encoding="utf-8"))
+    dataset_bytes = path.read_bytes()
+    data = json.loads(dataset_bytes.decode("utf-8"))
     if provider == "cloud":
         if data.get("version") != "exercise-live-v1":
             raise ValueError("cloud requires an exercise-live-v1 dataset without scripted candidate labels")
@@ -240,7 +245,7 @@ def evaluate(path=None, *, provider="mock", model=None, base_url=None, api_key=N
         endpoint = urlparse(base_url or "")
         if endpoint.scheme not in ("http", "https") or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
             raise ValueError("base URL must be HTTP(S), without credentials, query or fragment")
-    cases = load_cases(path)
+    cases = parse_cases(data)
     rows = []
     for repeat in range(1, repeats + 1):
         for case in cases:
@@ -254,7 +259,7 @@ def evaluate(path=None, *, provider="mock", model=None, base_url=None, api_key=N
                 raise AssertionError(f"unfair initial candidates for {case.id}")
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True)
     dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True)
-    return {"dataset_version": data["version"], "dataset_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    return {"dataset_version": data["version"], "dataset_sha256": hashlib.sha256(dataset_bytes).hexdigest(),
             "source_commit": revision.stdout.strip() if revision.returncode == 0 else None,
             "source_dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None,
             "provider": provider, "repeats": repeats,
