@@ -206,3 +206,37 @@ def test_invalid_output_path_fails_before_evaluation(monkeypatch, tmp_path):
         main()
     assert error.value.code == 2
     assert output.read_text(encoding="utf-8") == "keep me"
+
+
+@pytest.mark.parametrize("provider", ["mock", "cloud"])
+@pytest.mark.parametrize("payload, message", [
+    (None, "dataset must be a JSON object"),
+    ([], "dataset must be a JSON object"),
+    ({"version": "exercise-live-v1"}, "dataset cases must be a JSON array"),
+    ({"version": "exercise-live-v1", "cases": None}, "dataset cases must be a JSON array"),
+    ({"version": "exercise-live-v1", "cases": {}}, "dataset cases must be a JSON array"),
+    ({"version": "exercise-live-v1", "cases": "invalid"}, "dataset cases must be a JSON array"),
+    ({"version": "exercise-live-v1", "cases": [None]}, "Case"),
+])
+def test_malformed_dataset_cli_fails_cleanly_before_model_calls(
+        monkeypatch, tmp_path, capsys, provider, payload, message):
+    dataset = tmp_path / "malformed.json"
+    dataset.write_text(json.dumps(payload), encoding="utf-8")
+    output = tmp_path / "output"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid dataset reached model execution")
+
+    monkeypatch.setattr("evals.run.run_case", forbidden)
+    monkeypatch.setattr(httpx, "post", forbidden)
+    monkeypatch.setenv("EVAL_TEST_KEY", "test-key")
+    monkeypatch.setattr(sys, "argv", ["evals.run", "--provider", provider,
+        "--dataset", str(dataset), "--output", str(output), "--model", "test-model",
+        "--base-url", "https://model.example", "--api-key-env", "EVAL_TEST_KEY"])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    stderr = capsys.readouterr().err
+    assert message in stderr
+    assert "Traceback" not in stderr
+    assert list(output.iterdir()) == []

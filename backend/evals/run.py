@@ -62,8 +62,12 @@ def load_cases(path=DATASET):
 
 
 def parse_cases(data):
+    if not isinstance(data, dict):
+        raise ValueError("dataset must be a JSON object")
     if data.get("version") not in ("exercise-v1", "exercise-live-v1"):
         raise ValueError("unsupported dataset version")
+    if not isinstance(data.get("cases"), list):
+        raise ValueError("dataset cases must be a JSON array")
     cases = [Case.model_validate(c) for c in data["cases"]]
     if not cases or len({c.id for c in cases}) != len(cases):
         raise ValueError("dataset must have nonempty, unique case IDs")
@@ -235,6 +239,7 @@ def evaluate(path=None, *, provider="mock", model=None, base_url=None, api_key=N
     path = Path(path or (LIVE_DATASET if provider == "cloud" else DATASET))
     dataset_bytes = path.read_bytes()
     data = json.loads(dataset_bytes.decode("utf-8"))
+    cases = parse_cases(data)
     if provider == "cloud":
         if data.get("version") != "exercise-live-v1":
             raise ValueError("cloud requires an exercise-live-v1 dataset without scripted candidate labels")
@@ -245,7 +250,6 @@ def evaluate(path=None, *, provider="mock", model=None, base_url=None, api_key=N
         endpoint = urlparse(base_url or "")
         if endpoint.scheme not in ("http", "https") or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
             raise ValueError("base URL must be HTTP(S), without credentials, query or fragment")
-    cases = parse_cases(data)
     rows = []
     for repeat in range(1, repeats + 1):
         for case in cases:
