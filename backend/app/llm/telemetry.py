@@ -30,7 +30,8 @@ def post_with_metrics(url, **kwargs):
                 if type(value) is int and value >= 0:
                     record["usage"][key] = value
         return response
-    except httpx.HTTPError as error:
+    except BaseException as error:
+        # Observe interruptions too, but always propagate them to the caller.
         record["error_type"] = type(error).__name__
         raise
     finally:
@@ -60,7 +61,7 @@ class TracedGateway:
             status, error_type = "success", None
             try:
                 return target(*args, **kwargs)
-            except Exception as error:
+            except BaseException as error:
                 status, error_type = "error", type(error).__name__
                 raise
             finally:

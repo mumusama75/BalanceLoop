@@ -261,3 +261,36 @@ def test_direct_call_after_traced_call_does_not_append_to_old_span(gateway):
     before = deepcopy(trace.steps[0].detail)
     run(client)
     assert trace.steps[0].detail == before
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_interrupted_calls_propagate_and_are_not_reported_as_success(gateway, monkeypatch, error_type):
+    client, responses, _ = gateway
+    proxy, trace = traced(client)
+    error = error_type("private-interruption-detail")
+    original_post = httpx.post
+
+    def interrupt(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(httpx, "post", interrupt)
+    with pytest.raises(error_type) as caught:
+        run(proxy)
+    assert caught.value is error
+    failed = trace.steps[0].detail
+    assert failed["status"] == "error"
+    assert failed["error_type"] == error_type.__name__
+    assert failed["attempt_count"] == 1 and failed["retry_count"] == 0
+    assert failed["attempts"][0]["error_type"] == error_type.__name__
+    assert failed["usage"]["total_tokens"] is None
+    assert "private-interruption-detail" not in str(trace.as_list())
+
+    before = deepcopy(failed)
+    monkeypatch.setattr(httpx, "post", original_post)
+    responses.extend([(200, envelope()), (200, envelope(usage={"total_tokens": 8}))])
+    run(client)
+    assert trace.steps[0].detail == before
+    run(proxy)
+    success = trace.steps[1].detail
+    assert success["status"] == "success" and success["error_type"] is None
+    assert success["attempt_count"] == 1 and success["usage"]["total_tokens"] == 8
